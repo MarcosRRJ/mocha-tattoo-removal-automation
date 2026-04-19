@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 
 from mocha_script_exporter import MochaLayerSpec, build_mocha_python_script
-from occlusion_detector import OcclusionEvent, detect_occlusions
+from occlusion_detector import OcclusionEvent, detect_occlusions_debug
 from tracking_optimizer import choose_tracking_parameters
 
 
@@ -136,13 +136,15 @@ def analyze_and_export(
     sample_every_n_frames = int(config.get("sample_every_n_frames", 2))
     occlusion_threshold = float(config.get("occlusion_threshold", 0.62))
     max_occlusion_gap = int(config.get("max_occlusion_gap", 6))
+    roi = config.get("roi")
 
     # detect occlusions
-    occlusions = detect_occlusions(
+    occlusions, score_samples = detect_occlusions_debug(
         input_path,
         sample_every_n_frames=sample_every_n_frames,
         occlusion_threshold=occlusion_threshold,
         max_occlusion_gap=max_occlusion_gap,
+        roi=(str(roi) if roi else None),
     )
 
     blocks = _compute_blocks_from_occlusions(
@@ -163,6 +165,11 @@ def analyze_and_export(
         for ev in occlusions
     ]
     _write_csv(str(out / "occlusions.csv"), occl_rows, ["start_frame", "end_frame", "score_peak", "kind"])
+    _write_csv(
+        str(out / "occlusion_scores.csv"),
+        score_samples,
+        ["frame", "score", "threshold_used"],
+    )
 
     # export blocks.csv + layer specs
     block_rows: List[Dict[str, Any]] = []
@@ -231,10 +238,11 @@ def _cli() -> int:
     p.add_argument("--sample-every-n-frames", type=int, default=None, help="Amostragem do detector (N).")
     p.add_argument("--occlusion-threshold", type=float, default=None, help="Threshold do score (0-1).")
     p.add_argument("--max-occlusion-gap", type=int, default=None, help="Gap máx (frames amostrados) para unir eventos.")
+    p.add_argument("--roi", default=None, help="ROI para detector no formato x,y,w,h (ex.: 520,260,280,220).")
     p.add_argument("--write-mocha-script", action="store_true", help="Gera mocha_import_script.py em out-dir.")
     args = p.parse_args()
 
-    from mocha_config_generator import build_config_from_profile, load_templates, write_config
+    from mocha_config_generator import build_config_from_profile, load_templates
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -250,13 +258,19 @@ def _cli() -> int:
         max_occlusion_gap=args.max_occlusion_gap,
     )
 
+    config_dict = cfg.to_dict()
+    if args.roi:
+        config_dict["roi"] = args.roi
+
     # escreve config efetiva
-    write_config(str(out / "project_config.json"), cfg)
+    with open(out / "project_config.json", "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, ensure_ascii=False, indent=2)
+        f.write("\n")
 
     analyze_and_export(
         input_path=args.input,
         out_dir=str(out),
-        config=cfg.to_dict(),
+        config=config_dict,
         write_mocha_script=bool(args.write_mocha_script),
     )
     return 0

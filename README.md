@@ -32,6 +32,7 @@ python mocha_block_splitter.py \
   --input "input.mov" \
   --out-dir "out" \
   --profile "skin_tattooed_medium" \
+  --roi "520,260,280,220" \
   --min-block-len 12 \
   --safety-buffer 7 \
   --write-mocha-script
@@ -41,8 +42,11 @@ Saídas geradas em `out/`:
 - `project_config.json`
 - `blocks.csv`
 - `occlusions.csv`
+- `occlusion_scores.csv` (score por frame amostrado + threshold usado)
 - `report.json`
 - `mocha_import_script.py`
+
+> Dica: para tattoo na lombar, use `--roi x,y,w,h` para analisar só a área relevante e aumentar a sensibilidade a mão/braço.
 
 ### 2) Rodar o exemplo end-to-end
 
