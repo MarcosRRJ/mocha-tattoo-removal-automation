@@ -1,0 +1,7 @@
+# Requirements for Mocha Pro Tattoo Removal Automation
+
+# Python Dependencies
+numpy
+opencv-python
+scikit-image
+pandas
