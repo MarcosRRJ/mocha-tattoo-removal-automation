@@ -13,7 +13,7 @@ para evoluir (ex.: MediaPipe/YOLO opcional).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -81,23 +81,39 @@ def _motion_score(prev_gray: np.ndarray, gray: np.ndarray) -> float:
     return score
 
 
+def _normalize_scores(scores: Sequence[float]) -> List[float]:
+    """
+    Normaliza scores brutos para [0..1] via percentis robustos.
+    Isso evita depender da escala absoluta da diferença de pixels.
+    """
+    if not scores:
+        return []
+    arr = np.array(scores, dtype=np.float32)
+    lo = float(np.percentile(arr, 10))
+    hi = float(np.percentile(arr, 95))
+    denom = max(hi - lo, 1e-6)
+    normalized = np.clip((arr - lo) / denom, 0.0, 1.0)
+    return [float(v) for v in normalized]
+
+
 def _group_events(
-    scores: List[float],
+    scores: Sequence[float],
+    sample_frames: Sequence[int],
     *,
-    sample_every_n_frames: int,
     threshold: float,
     max_gap: int,
 ) -> List[OcclusionEvent]:
     """
-    scores indexado por 'sample index' (não por frame absoluto).
-    Converte para ranges em frame absoluto: idx * sample_every_n_frames.
+    scores indexado por sample, usando sample_frames para frame absoluto.
     """
+    if len(scores) != len(sample_frames):
+        raise ValueError("scores e sample_frames devem ter o mesmo tamanho.")
+
     events: List[OcclusionEvent] = []
 
     in_event = False
     start_i = 0
     peak = 0.0
-    peak_i = 0
     gap = 0
 
     for i, s in enumerate(scores):
@@ -106,24 +122,22 @@ def _group_events(
                 in_event = True
                 start_i = i
                 peak = s
-                peak_i = i
                 gap = 0
             else:
                 gap = 0
                 if s > peak:
                     peak = s
-                    peak_i = i
         else:
             if in_event:
                 gap += 1
                 if gap > max_gap:
                     end_i = i - gap
-                    start_f = start_i * sample_every_n_frames
-                    end_f = end_i * sample_every_n_frames
+                    start_f = int(sample_frames[start_i])
+                    end_f = int(sample_frames[end_i])
                     events.append(
                         OcclusionEvent(
-                            start_frame=int(start_f),
-                            end_frame=int(end_f),
+                            start_frame=start_f,
+                            end_frame=end_f,
                             score_peak=float(peak),
                             kind="occlusion",
                         )
@@ -132,18 +146,64 @@ def _group_events(
 
     if in_event:
         end_i = len(scores) - 1
-        start_f = start_i * sample_every_n_frames
-        end_f = end_i * sample_every_n_frames
+        start_f = int(sample_frames[start_i])
+        end_f = int(sample_frames[end_i])
         events.append(
             OcclusionEvent(
-                start_frame=int(start_f),
-                end_frame=int(end_f),
+                start_frame=start_f,
+                end_frame=end_f,
                 score_peak=float(peak),
                 kind="occlusion",
             )
         )
 
     return events
+
+
+def _collect_motion_scores(
+    video_path: str,
+    *,
+    sample_every_n_frames: int,
+    max_frames: Optional[int],
+    roi: Optional[str],
+) -> Tuple[List[int], List[float]]:
+    if sample_every_n_frames < 1:
+        raise ValueError("sample_every_n_frames deve ser >= 1.")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Não foi possível abrir o vídeo: {video_path}")
+
+    roi_spec = _parse_roi(roi)
+
+    prev_full = _read_gray(cap)
+    prev = _crop_roi(prev_full, roi_spec) if prev_full is not None else None
+    if prev is None:
+        cap.release()
+        return [], []
+
+    raw_scores: List[float] = []
+    sample_frames: List[int] = []
+
+    frame_abs = 1
+    while True:
+        gray_full = _read_gray(cap)
+        if gray_full is None:
+            break
+        gray = _crop_roi(gray_full, roi_spec)
+
+        if max_frames is not None and frame_abs >= max_frames:
+            break
+
+        if (frame_abs % sample_every_n_frames) == 0:
+            raw_scores.append(_motion_score(prev, gray))
+            sample_frames.append(frame_abs)
+
+        prev = gray
+        frame_abs += 1
+
+    cap.release()
+    return sample_frames, raw_scores
 
 
 def detect_occlusions(
@@ -163,54 +223,19 @@ def detect_occlusions(
     - max_occlusion_gap: número de samples abaixo do threshold ainda dentro do mesmo evento
     - max_frames: limita processamento para debug
     """
-    if sample_every_n_frames < 1:
-        raise ValueError("sample_every_n_frames deve ser >= 1.")
+    sample_frames, raw_scores = _collect_motion_scores(
+        video_path,
+        sample_every_n_frames=sample_every_n_frames,
+        max_frames=max_frames,
+        roi=roi,
+    )
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Não foi possível abrir o vídeo: {video_path}")
-
-    roi_spec = _parse_roi(roi)
-
-    prev_full = _read_gray(cap)
-    prev = _crop_roi(prev_full, roi_spec) if prev_full is not None else None
-    if prev is None:
-        cap.release()
-        return []
-
-    scores: List[float] = []
-
-    # frame absoluto atual no arquivo
-    frame_abs = 1
-    while True:
-        gray_full = _read_gray(cap)
-        if gray_full is None:
-            break
-        gray = _crop_roi(gray_full, roi_spec)
-
-        if max_frames is not None and frame_abs >= max_frames:
-            break
-
-        if (frame_abs % sample_every_n_frames) == 0:
-            s = _motion_score(prev, gray)
-            scores.append(s)
-
-        prev = gray
-        frame_abs += 1
-
-    cap.release()
-
-    # threshold robusto: se vídeo for muito estável, baixa o threshold efetivo
-    if scores:
-        p90 = float(np.percentile(np.array(scores, dtype=np.float32), 90))
-        # garante que não fica impossível detectar em vídeos muito “calmos”
-        adaptive_threshold = max(occlusion_threshold, min(0.85, p90 * 0.85))
-    else:
-        adaptive_threshold = occlusion_threshold
+    scores = _normalize_scores(raw_scores)
+    adaptive_threshold = float(np.clip(occlusion_threshold, 0.0, 1.0))
 
     events = _group_events(
         scores,
-        sample_every_n_frames=sample_every_n_frames,
+        sample_frames,
         threshold=adaptive_threshold,
         max_gap=max_occlusion_gap,
     )
@@ -225,60 +250,34 @@ def detect_occlusions_debug(
     max_occlusion_gap: int = 6,
     max_frames: Optional[int] = None,
     roi: Optional[str] = None,
-) -> Tuple[List[OcclusionEvent], List[Dict[str, float]]]:
+) -> Tuple[List[OcclusionEvent], List[Dict[str, float | int]]]:
     """
     Versão de debug: retorna (eventos, amostras score por frame amostrado).
     """
-    if sample_every_n_frames < 1:
-        raise ValueError("sample_every_n_frames deve ser >= 1.")
+    sample_frames, raw_scores = _collect_motion_scores(
+        video_path,
+        sample_every_n_frames=sample_every_n_frames,
+        max_frames=max_frames,
+        roi=roi,
+    )
+    samples: List[Dict[str, float | int]] = []
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Não foi possível abrir o vídeo: {video_path}")
-
-    roi_spec = _parse_roi(roi)
-
-    prev_full = _read_gray(cap)
-    prev = _crop_roi(prev_full, roi_spec) if prev_full is not None else None
-    if prev is None:
-        cap.release()
-        return [], []
-
-    scores: List[float] = []
-    samples: List[Dict[str, float]] = []
-
-    frame_abs = 1
-    while True:
-        gray_full = _read_gray(cap)
-        if gray_full is None:
-            break
-        gray = _crop_roi(gray_full, roi_spec)
-
-        if max_frames is not None and frame_abs >= max_frames:
-            break
-
-        if (frame_abs % sample_every_n_frames) == 0:
-            s = _motion_score(prev, gray)
-            scores.append(s)
-            samples.append({"frame": float(frame_abs), "score": float(s)})
-
-        prev = gray
-        frame_abs += 1
-
-    cap.release()
-
-    if scores:
-        p90 = float(np.percentile(np.array(scores, dtype=np.float32), 90))
-        adaptive_threshold = max(occlusion_threshold, min(0.85, p90 * 0.85))
-    else:
-        adaptive_threshold = occlusion_threshold
+    scores = _normalize_scores(raw_scores)
+    adaptive_threshold = float(np.clip(occlusion_threshold, 0.0, 1.0))
 
     events = _group_events(
         scores,
-        sample_every_n_frames=sample_every_n_frames,
+        sample_frames,
         threshold=adaptive_threshold,
         max_gap=max_occlusion_gap,
     )
-    for sample in samples:
-        sample["threshold_used"] = adaptive_threshold
+    for frame, raw, normalized in zip(sample_frames, raw_scores, scores):
+        samples.append(
+            {
+                "frame": int(frame),
+                "raw_score": float(raw),
+                "score": float(normalized),
+                "threshold_used": adaptive_threshold,
+            }
+        )
     return events, samples

@@ -42,7 +42,7 @@ Saídas geradas em `out/`:
 - `project_config.json`
 - `blocks.csv`
 - `occlusions.csv`
-- `occlusion_scores.csv` (score por frame amostrado + threshold usado)
+- `occlusion_scores.csv` (frame, `raw_score`, `score` normalizado [0..1], `threshold_used`)
 - `report.json`
 - `mocha_import_script.py`
 

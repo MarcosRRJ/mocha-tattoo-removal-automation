@@ -168,7 +168,7 @@ def analyze_and_export(
     _write_csv(
         str(out / "occlusion_scores.csv"),
         score_samples,
-        ["frame", "score", "threshold_used"],
+        ["frame", "raw_score", "score", "threshold_used"],
     )
 
     # export blocks.csv + layer specs
