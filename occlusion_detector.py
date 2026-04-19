@@ -114,7 +114,6 @@ def _group_events(
     in_event = False
     start_i = 0
     peak = 0.0
-    peak_i = 0
     gap = 0
 
     for i, s in enumerate(scores):
@@ -123,13 +122,11 @@ def _group_events(
                 in_event = True
                 start_i = i
                 peak = s
-                peak_i = i
                 gap = 0
             else:
                 gap = 0
                 if s > peak:
                     peak = s
-                    peak_i = i
         else:
             if in_event:
                 gap += 1
@@ -163,6 +160,52 @@ def _group_events(
     return events
 
 
+def _collect_motion_scores(
+    video_path: str,
+    *,
+    sample_every_n_frames: int,
+    max_frames: Optional[int],
+    roi: Optional[str],
+) -> Tuple[List[int], List[float]]:
+    if sample_every_n_frames < 1:
+        raise ValueError("sample_every_n_frames deve ser >= 1.")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Não foi possível abrir o vídeo: {video_path}")
+
+    roi_spec = _parse_roi(roi)
+
+    prev_full = _read_gray(cap)
+    prev = _crop_roi(prev_full, roi_spec) if prev_full is not None else None
+    if prev is None:
+        cap.release()
+        return [], []
+
+    raw_scores: List[float] = []
+    sample_frames: List[int] = []
+
+    frame_abs = 1
+    while True:
+        gray_full = _read_gray(cap)
+        if gray_full is None:
+            break
+        gray = _crop_roi(gray_full, roi_spec)
+
+        if max_frames is not None and frame_abs >= max_frames:
+            break
+
+        if (frame_abs % sample_every_n_frames) == 0:
+            raw_scores.append(_motion_score(prev, gray))
+            sample_frames.append(frame_abs)
+
+        prev = gray
+        frame_abs += 1
+
+    cap.release()
+    return sample_frames, raw_scores
+
+
 def detect_occlusions(
     video_path: str,
     *,
@@ -180,46 +223,13 @@ def detect_occlusions(
     - max_occlusion_gap: número de samples abaixo do threshold ainda dentro do mesmo evento
     - max_frames: limita processamento para debug
     """
-    if sample_every_n_frames < 1:
-        raise ValueError("sample_every_n_frames deve ser >= 1.")
+    sample_frames, raw_scores = _collect_motion_scores(
+        video_path,
+        sample_every_n_frames=sample_every_n_frames,
+        max_frames=max_frames,
+        roi=roi,
+    )
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Não foi possível abrir o vídeo: {video_path}")
-
-    roi_spec = _parse_roi(roi)
-
-    prev_full = _read_gray(cap)
-    prev = _crop_roi(prev_full, roi_spec) if prev_full is not None else None
-    if prev is None:
-        cap.release()
-        return []
-
-    raw_scores: List[float] = []
-    sample_frames: List[int] = []
-
-    # frame absoluto atual no arquivo
-    frame_abs = 1
-    while True:
-        gray_full = _read_gray(cap)
-        if gray_full is None:
-            break
-        gray = _crop_roi(gray_full, roi_spec)
-
-        if max_frames is not None and frame_abs >= max_frames:
-            break
-
-        if (frame_abs % sample_every_n_frames) == 0:
-            s = _motion_score(prev, gray)
-            raw_scores.append(s)
-            sample_frames.append(frame_abs)
-
-        prev = gray
-        frame_abs += 1
-
-    cap.release()
-
-    # threshold robusto: se vídeo for muito estável, baixa o threshold efetivo
     scores = _normalize_scores(raw_scores)
     adaptive_threshold = float(np.clip(occlusion_threshold, 0.0, 1.0))
 
@@ -240,48 +250,17 @@ def detect_occlusions_debug(
     max_occlusion_gap: int = 6,
     max_frames: Optional[int] = None,
     roi: Optional[str] = None,
-) -> Tuple[List[OcclusionEvent], List[Dict[str, float]]]:
+) -> Tuple[List[OcclusionEvent], List[Dict[str, float | int]]]:
     """
     Versão de debug: retorna (eventos, amostras score por frame amostrado).
     """
-    if sample_every_n_frames < 1:
-        raise ValueError("sample_every_n_frames deve ser >= 1.")
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Não foi possível abrir o vídeo: {video_path}")
-
-    roi_spec = _parse_roi(roi)
-
-    prev_full = _read_gray(cap)
-    prev = _crop_roi(prev_full, roi_spec) if prev_full is not None else None
-    if prev is None:
-        cap.release()
-        return [], []
-
-    raw_scores: List[float] = []
-    sample_frames: List[int] = []
-    samples: List[Dict[str, float]] = []
-
-    frame_abs = 1
-    while True:
-        gray_full = _read_gray(cap)
-        if gray_full is None:
-            break
-        gray = _crop_roi(gray_full, roi_spec)
-
-        if max_frames is not None and frame_abs >= max_frames:
-            break
-
-        if (frame_abs % sample_every_n_frames) == 0:
-            s = _motion_score(prev, gray)
-            raw_scores.append(s)
-            sample_frames.append(frame_abs)
-
-        prev = gray
-        frame_abs += 1
-
-    cap.release()
+    sample_frames, raw_scores = _collect_motion_scores(
+        video_path,
+        sample_every_n_frames=sample_every_n_frames,
+        max_frames=max_frames,
+        roi=roi,
+    )
+    samples: List[Dict[str, float | int]] = []
 
     scores = _normalize_scores(raw_scores)
     adaptive_threshold = float(np.clip(occlusion_threshold, 0.0, 1.0))
@@ -295,7 +274,7 @@ def detect_occlusions_debug(
     for frame, raw, normalized in zip(sample_frames, raw_scores, scores):
         samples.append(
             {
-                "frame": float(frame),
+                "frame": int(frame),
                 "raw_score": float(raw),
                 "score": float(normalized),
                 "threshold_used": adaptive_threshold,
